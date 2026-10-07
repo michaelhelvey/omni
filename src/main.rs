@@ -3,6 +3,7 @@ mod doctor;
 mod fmt;
 mod formatter;
 mod language;
+mod pyproject;
 mod resolve;
 
 use std::io::Write;

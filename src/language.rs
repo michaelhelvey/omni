@@ -49,6 +49,8 @@ pub enum Language {
     GraphQl,
     /// Handlebars templates: `.hbs`, `.handlebars`.
     Handlebars,
+    /// Python: `.py`, `.pyi`.
+    Python,
     /// Rust: `.rs`.
     Rust,
 }
@@ -75,6 +77,7 @@ impl Language {
         Language::Mdx,
         Language::GraphQl,
         Language::Handlebars,
+        Language::Python,
         Language::Rust,
     ];
 
@@ -116,6 +119,7 @@ impl Language {
             "mdx" => Language::Mdx,
             "graphql" | "gql" => Language::GraphQl,
             "hbs" | "handlebars" => Language::Handlebars,
+            "py" | "pyi" => Language::Python,
             "rs" => Language::Rust,
             _ => return None,
         };
@@ -144,6 +148,7 @@ impl Language {
             Language::Mdx => "mdx",
             Language::GraphQl => "graphql",
             Language::Handlebars => "hbs",
+            Language::Python => "py",
             Language::Rust => "rs",
         }
     }

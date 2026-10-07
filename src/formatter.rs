@@ -5,9 +5,10 @@ use std::fmt;
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::language::Language;
+use crate::pyproject::PyProject;
 
 /// A formatter that omni can run.
 ///
@@ -15,8 +16,12 @@ use crate::language::Language;
 /// strength in the same directory, omni selects the formatter that is first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Formatter {
-    /// `vp fmt` from [Vite+](https://viteplus.dev/guide/fmt). It runs oxfmt, so it has a higher
-    /// priority than oxfmt.
+    /// [Vite+](https://viteplus.dev/guide/fmt). It formats with oxfmt and the `fmt` block of
+    /// `vite.config.*`, so it has a higher priority than oxfmt.
+    ///
+    /// omni does not run `vp fmt`, because it is approximately 7 times slower for one file. It runs
+    /// `node_modules/.bin/oxfmt`, which `vite-plus` installs for editors. This wrapper sets
+    /// `VP_VERSION`, so that oxfmt reads the `fmt` block in `vite.config.*`.
     VitePlus,
     /// [oxfmt](https://oxc.rs/docs/guide/usage/formatter.html).
     Oxfmt,
@@ -24,6 +29,9 @@ pub enum Formatter {
     Rstack,
     /// [Prettier](https://prettier.io).
     Prettier,
+    /// [Ruff](https://docs.astral.sh/ruff/formatter/). omni sorts the imports and then formats
+    /// the file, the same as `ruff check --select I --fix` and then `ruff format`.
+    Ruff,
     /// [rustfmt](https://github.com/rust-lang/rustfmt).
     Rustfmt,
 }
@@ -33,10 +41,11 @@ pub enum Formatter {
 /// The order of the variants is important. A stronger signal has a larger value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Strength {
-    /// The formatter is a dependency in `package.json`, or the project is a Cargo package.
+    /// The formatter is a dependency in `package.json` or `pyproject.toml`, or the project is a
+    /// Cargo package.
     Dependency,
-    /// `package.json` has a key for the formatter configuration.
-    PackageJsonKey,
+    /// `package.json` or `pyproject.toml` has a key for the formatter configuration.
+    ManifestKey,
     /// A configuration file for the formatter exists.
     ConfigFile,
 }
@@ -99,14 +108,17 @@ const VITE_CONFIGS: &[&str] = &[
 
 const RUSTFMT_CONFIGS: &[&str] = &["rustfmt.toml", ".rustfmt.toml"];
 
+const RUFF_CONFIGS: &[&str] = &["ruff.toml", ".ruff.toml"];
+
 impl Formatter {
     /// The name of the formatter for messages.
     pub fn name(self) -> &'static str {
         match self {
-            Formatter::VitePlus => "vp fmt",
+            Formatter::VitePlus => "vite+ (oxfmt)",
             Formatter::Oxfmt => "oxfmt",
             Formatter::Rstack => "rs fmt",
             Formatter::Prettier => "prettier",
+            Formatter::Ruff => "ruff",
             Formatter::Rustfmt => "rustfmt",
         }
     }
@@ -115,9 +127,12 @@ impl Formatter {
     pub fn supports(self, language: Language) -> bool {
         use Language::*;
         match self {
-            Formatter::VitePlus | Formatter::Oxfmt => !matches!(language, Rust),
+            Formatter::VitePlus | Formatter::Oxfmt => !matches!(language, Rust | Python),
             // rs fmt supports the same built-in languages as Prettier.
-            Formatter::Rstack | Formatter::Prettier => !matches!(language, Rust | Toml | Svelte),
+            Formatter::Rstack | Formatter::Prettier => {
+                !matches!(language, Rust | Python | Toml | Svelte)
+            }
+            Formatter::Ruff => matches!(language, Python),
             Formatter::Rustfmt => matches!(language, Rust),
         }
     }
@@ -126,42 +141,60 @@ impl Formatter {
     pub fn defaults(language: Language) -> &'static [Formatter] {
         match language {
             Language::Rust => &[Formatter::Rustfmt],
+            Language::Python => &[Formatter::Ruff],
             // Prettier does not support all languages. oxfmt formats the others.
             _ => &[Formatter::Prettier, Formatter::Oxfmt],
         }
     }
 
-    /// The name of the binary in `node_modules/.bin`, if the formatter is an npm package.
-    pub fn npm_bin(self) -> Option<&'static str> {
+    /// The path of the binary that a project installs, relative to the project directory. For
+    /// example, `node_modules/.bin/prettier`. `None` if projects do not install the formatter.
+    pub fn local_bin(self) -> Option<Utf8PathBuf> {
+        let npm = |name: &str| {
+            // On Windows, npm installs a `.cmd` wrapper. Only the wrapper can run.
+            let name = if cfg!(windows) {
+                format!("{name}.cmd")
+            } else {
+                name.to_owned()
+            };
+            Some(Utf8PathBuf::from("node_modules/.bin").join(name))
+        };
         match self {
-            Formatter::VitePlus => Some("vp"),
-            Formatter::Oxfmt => Some("oxfmt"),
-            Formatter::Rstack => Some("rs"),
-            Formatter::Prettier => Some("prettier"),
+            Formatter::VitePlus | Formatter::Oxfmt => npm("oxfmt"),
+            Formatter::Rstack => npm("rs"),
+            Formatter::Prettier => npm("prettier"),
+            // The virtual environment that uv and most other tools make.
+            Formatter::Ruff if cfg!(windows) => Some(".venv/Scripts/ruff.exe".into()),
+            Formatter::Ruff => Some(".venv/bin/ruff".into()),
             Formatter::Rustfmt => None,
         }
     }
 
-    /// The name of the binary to find on `PATH`.
-    pub fn path_bin(self) -> &'static str {
+    /// The name of the binary to find on `PATH`. `None` if omni must use the binary of the
+    /// project.
+    pub fn path_bin(self) -> Option<&'static str> {
         match self {
-            Formatter::VitePlus => "vp",
-            Formatter::Oxfmt => "oxfmt",
+            // A binary on `PATH` does not know the `vite-plus` version of the project. Also, an
+            // `oxfmt` on `PATH` is usually plain oxfmt, which ignores `vite.config.*`.
+            Formatter::VitePlus => None,
+            Formatter::Oxfmt => Some("oxfmt"),
             // Do not use `rs` from `PATH`. On BSD and macOS, `/usr/bin/rs` is a different program.
             // The `rstack` package also installs the `rstack` alias.
-            Formatter::Rstack => "rstack",
-            Formatter::Prettier => "prettier",
-            Formatter::Rustfmt => "rustfmt",
+            Formatter::Rstack => Some("rstack"),
+            Formatter::Prettier => Some("prettier"),
+            Formatter::Ruff => Some("ruff"),
+            Formatter::Rustfmt => Some("rustfmt"),
         }
     }
 
     /// Find the signals for each formatter in one directory.
     ///
-    /// `entries` contains the names of the files in the directory. `package_json` is the parsed
-    /// `package.json` of the directory, if it exists.
+    /// `entries` contains the names of the files in the directory. `package_json` and `pyproject`
+    /// are the parsed `package.json` and `pyproject.toml` of the directory, if they exist.
     pub fn detect(
         entries: &HashSet<String>,
         package_json: Option<&serde_json::Value>,
+        pyproject: Option<&PyProject>,
     ) -> Vec<Signal> {
         let mut signals = Vec::new();
 
@@ -180,6 +213,7 @@ impl Formatter {
         config_files(Formatter::Rstack, RSTACK_CONFIGS);
         config_files(Formatter::Prettier, PRETTIER_CONFIGS);
         config_files(Formatter::Rustfmt, RUSTFMT_CONFIGS);
+        config_files(Formatter::Ruff, RUFF_CONFIGS);
 
         if entries.contains("Cargo.toml") {
             signals.push(Signal {
@@ -208,7 +242,7 @@ impl Formatter {
             if package_json.get("prettier").is_some() {
                 signals.push(Signal {
                     formatter: Formatter::Prettier,
-                    strength: Strength::PackageJsonKey,
+                    strength: Strength::ManifestKey,
                     reason: "`package.json` has a `prettier` key".to_owned(),
                 });
             }
@@ -229,34 +263,81 @@ impl Formatter {
             }
         }
 
+        if let Some(pyproject) = pyproject {
+            if pyproject.has_ruff_config() {
+                signals.push(Signal {
+                    formatter: Formatter::Ruff,
+                    strength: Strength::ManifestKey,
+                    reason: "`pyproject.toml` has a `[tool.ruff]` table".to_owned(),
+                });
+            }
+            if let Some(section) = pyproject.dependency_section("ruff") {
+                signals.push(Signal {
+                    formatter: Formatter::Ruff,
+                    strength: Strength::Dependency,
+                    reason: format!("`pyproject.toml` has `ruff` in `{section}`"),
+                });
+            }
+        }
+
         signals
     }
 
-    /// The arguments to format one file from stdin to stdout.
+    /// The commands to format one file from stdin to stdout. omni runs each command with the
+    /// same binary, and gives the output of a command to the next command.
     ///
     /// `filepath` is the name of the file. The formatter uses it to select a parser and to apply
-    /// its configuration. `edition` is the Rust edition. omni uses it only for rustfmt.
-    pub fn stdin_args(self, filepath: &Utf8Path, edition: Option<&str>) -> Vec<String> {
+    /// its configuration. `edition` is the Rust edition. omni uses it only for rustfmt. `options`
+    /// are the arguments from [`Formatter::option_args`].
+    pub fn stdin_commands(
+        self,
+        filepath: &Utf8Path,
+        edition: Option<&str>,
+        options: &[String],
+    ) -> Vec<Vec<String>> {
+        let filepath = filepath.to_string();
+        let command = |parts: &[&[&str]]| -> Vec<String> {
+            parts
+                .iter()
+                .flat_map(|part| part.iter().map(|s| s.to_string()))
+                .collect()
+        };
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
+
         match self {
-            // The `vp fmt` help shows the `=` form. `vp` sends the options to oxfmt.
-            Formatter::VitePlus => vec!["fmt".to_owned(), format!("--stdin-filepath={filepath}")],
-            Formatter::Oxfmt | Formatter::Prettier => {
-                vec!["--stdin-filepath".to_owned(), filepath.to_string()]
+            Formatter::VitePlus | Formatter::Oxfmt | Formatter::Prettier => {
+                vec![command(&[&options, &["--stdin-filepath", &filepath]])]
             }
-            Formatter::Rstack => vec![
-                "fmt".to_owned(),
-                "--stdin-filepath".to_owned(),
-                filepath.to_string(),
-            ],
+            Formatter::Rstack => vec![command(&[
+                &["fmt"],
+                &options,
+                &["--stdin-filepath", &filepath],
+            ])],
+            Formatter::Ruff => {
+                // `--force-exclude` obeys the `exclude` setting of the project, also for a file
+                // from stdin. ruff then gives the source back without changes.
+                let stdin = ["--force-exclude", "--stdin-filename", &filepath, "-"];
+                vec![
+                    // Sort the imports. Only I001 (unsorted imports) is a formatting rule.
+                    // `--exit-zero`: a syntax error does not stop the chain here. `ruff format`
+                    // finds it and fails.
+                    command(&[
+                        &["check", "--select=I001", "--fix", "--exit-zero", "--quiet"],
+                        &options,
+                        &stdin,
+                    ]),
+                    command(&[&["format"], &options, &stdin]),
+                ]
+            }
             Formatter::Rustfmt => {
-                let mut args = Vec::new();
-                if let Some(edition) = edition {
-                    args.push(format!("--edition={edition}"));
-                }
+                let edition = edition.map(|e| format!("--edition={e}"));
                 // Without a file argument, rustfmt reads stdin. It does not follow `mod`
                 // declarations into other files.
-                args.push("--emit=stdout".to_owned());
-                args
+                vec![command(&[
+                    &options,
+                    &edition.as_deref().into_iter().collect::<Vec<_>>(),
+                    &["--emit=stdout"],
+                ])]
             }
         }
     }
@@ -276,11 +357,11 @@ impl Formatter {
     /// Make the arguments that give `options` to the formatter.
     ///
     /// Prettier and oxfmt get a temporary JSON configuration file. rustfmt gets
-    /// `--config key=value,...`.
+    /// `--config key=value,...`. ruff gets one `--config "key = value"` for each option.
     pub fn option_args(self, options: &toml::Table) -> Result<OptionArgs> {
         match self {
             Formatter::Prettier | Formatter::Oxfmt => {
-                let json = toml_to_json(&toml::Value::Table(options.clone()));
+                let json = serde_json::to_value(options)?;
                 // Both formatters select the configuration format from the extension.
                 let mut file = tempfile::Builder::new()
                     .prefix("omni-")
@@ -317,6 +398,14 @@ impl Formatter {
                     _file: None,
                 })
             }
+            Formatter::Ruff => {
+                let mut args = Vec::new();
+                for (key, value) in flatten(options) {
+                    args.push("--config".to_owned());
+                    args.push(format!("{key} = {value}"));
+                }
+                Ok(OptionArgs { args, _file: None })
+            }
             Formatter::VitePlus | Formatter::Rstack => {
                 bail!("{self} cannot be a default formatter, so it has no default options")
             }
@@ -324,23 +413,21 @@ impl Formatter {
     }
 }
 
-/// Convert a TOML value to JSON. omni writes the default options for Prettier and oxfmt as JSON.
-fn toml_to_json(value: &toml::Value) -> serde_json::Value {
-    use serde_json::Value as Json;
-    match value {
-        toml::Value::String(s) => Json::String(s.clone()),
-        toml::Value::Integer(i) => Json::from(*i),
-        toml::Value::Float(f) => Json::from(*f),
-        toml::Value::Boolean(b) => Json::Bool(*b),
-        toml::Value::Datetime(d) => Json::String(d.to_string()),
-        toml::Value::Array(items) => Json::Array(items.iter().map(toml_to_json).collect()),
-        toml::Value::Table(table) => Json::Object(
-            table
-                .iter()
-                .map(|(k, v)| (k.clone(), toml_to_json(v)))
-                .collect(),
-        ),
+/// Flatten nested tables to dotted keys. For example, `[format] quote-style = "single"` becomes
+/// `("format.quote-style", "single")`. ruff takes one option for each `--config`.
+fn flatten(table: &toml::Table) -> Vec<(String, &toml::Value)> {
+    let mut pairs = Vec::new();
+    for (key, value) in table {
+        match value {
+            toml::Value::Table(inner) => {
+                for (inner_key, inner_value) in flatten(inner) {
+                    pairs.push((format!("{key}.{inner_key}"), inner_value));
+                }
+            }
+            _ => pairs.push((key.clone(), value)),
+        }
     }
+    pairs
 }
 
 impl fmt::Display for Formatter {
@@ -414,7 +501,7 @@ mod tests {
 
     #[test]
     fn detects_config_files() {
-        let signals = Formatter::detect(&entries(&[".prettierrc", "README.md"]), None);
+        let signals = Formatter::detect(&entries(&[".prettierrc", "README.md"]), None, None);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].formatter, Formatter::Prettier);
         assert_eq!(signals[0].strength, Strength::ConfigFile);
@@ -426,12 +513,11 @@ mod tests {
             "prettier": {},
             "devDependencies": { "oxfmt": "1.0.0" },
         });
-        let signals = Formatter::detect(&entries(&["package.json"]), Some(&package_json));
+        let signals = Formatter::detect(&entries(&["package.json"]), Some(&package_json), None);
         assert!(
             signals
                 .iter()
-                .any(|s| s.formatter == Formatter::Prettier
-                    && s.strength == Strength::PackageJsonKey)
+                .any(|s| s.formatter == Formatter::Prettier && s.strength == Strength::ManifestKey)
         );
         assert!(
             signals
@@ -449,6 +535,7 @@ mod tests {
         let signals = Formatter::detect(
             &entries(&["vite.config.ts", "package.json"]),
             Some(&vite_plus),
+            None,
         );
         assert!(
             signals
@@ -457,11 +544,15 @@ mod tests {
         );
 
         // A plain Vite project: no signal.
-        let signals = Formatter::detect(&entries(&["vite.config.ts", "package.json"]), Some(&vite));
+        let signals = Formatter::detect(
+            &entries(&["vite.config.ts", "package.json"]),
+            Some(&vite),
+            None,
+        );
         assert!(signals.is_empty());
 
         // The `vite-plus` package without a Vite config: only a dependency signal.
-        let signals = Formatter::detect(&entries(&["package.json"]), Some(&vite_plus));
+        let signals = Formatter::detect(&entries(&["package.json"]), Some(&vite_plus), None);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].strength, Strength::Dependency);
     }
@@ -501,25 +592,78 @@ mod tests {
 
     #[test]
     fn rstack_never_uses_rs_from_path() {
-        assert_eq!(Formatter::Rstack.path_bin(), "rstack");
-        assert_eq!(Formatter::Rstack.npm_bin(), Some("rs"));
+        assert_eq!(Formatter::Rstack.path_bin(), Some("rstack"));
+        assert_eq!(
+            Formatter::Rstack.local_bin().unwrap().file_name(),
+            Some(if cfg!(windows) { "rs.cmd" } else { "rs" })
+        );
     }
 
     #[test]
-    fn stdin_args() {
+    fn stdin_commands() {
         let path = Utf8Path::new("a/b.md");
         assert_eq!(
-            Formatter::VitePlus.stdin_args(path, None),
-            ["fmt", "--stdin-filepath=a/b.md"]
+            Formatter::VitePlus.stdin_commands(path, None, &[]),
+            [["--stdin-filepath", "a/b.md"]]
         );
         assert_eq!(
-            Formatter::Rstack.stdin_args(path, None),
-            ["fmt", "--stdin-filepath", "a/b.md"]
+            Formatter::Rstack.stdin_commands(path, None, &[]),
+            [["fmt", "--stdin-filepath", "a/b.md"]]
         );
         assert_eq!(
-            Formatter::Rustfmt.stdin_args(path, Some("2024")),
-            ["--edition=2024", "--emit=stdout"]
+            Formatter::Rustfmt.stdin_commands(path, Some("2024"), &[]),
+            [["--edition=2024", "--emit=stdout"]]
         );
+    }
+
+    #[test]
+    fn ruff_sorts_imports_then_formats() {
+        let path = Utf8Path::new("a/b.py");
+        let options = ["--config".to_owned(), "line-length = 100".to_owned()];
+        let commands = Formatter::Ruff.stdin_commands(path, None, &options);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0][0], "check");
+        assert!(commands[0].contains(&"--select=I001".to_owned()));
+        assert_eq!(commands[1][0], "format");
+        for command in &commands {
+            assert!(command.contains(&"line-length = 100".to_owned()));
+            assert_eq!(
+                command[command.len() - 3..],
+                ["--stdin-filename", "a/b.py", "-"]
+            );
+        }
+    }
+
+    #[test]
+    fn option_args_for_ruff_flatten_tables() {
+        let options: toml::Table = "line-length = 100\n[format]\nquote-style = \"single\"\n"
+            .parse()
+            .unwrap();
+        let option_args = Formatter::Ruff.option_args(&options).unwrap();
+        assert_eq!(
+            option_args.args,
+            [
+                "--config",
+                "format.quote-style = \"single\"",
+                "--config",
+                "line-length = 100",
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_ruff() {
+        let signals = Formatter::detect(&entries(&["ruff.toml"]), None, None);
+        assert_eq!(signals[0].formatter, Formatter::Ruff);
+        assert_eq!(signals[0].strength, Strength::ConfigFile);
+
+        let pyproject = PyProject::parse(
+            "[tool.ruff]\nline-length = 100\n[dependency-groups]\ndev = [\"ruff\"]\n",
+        )
+        .unwrap();
+        let signals = Formatter::detect(&entries(&["pyproject.toml"]), None, Some(&pyproject));
+        let strengths: Vec<Strength> = signals.iter().map(|s| s.strength).collect();
+        assert_eq!(strengths, [Strength::ManifestKey, Strength::Dependency]);
     }
 
     #[test]

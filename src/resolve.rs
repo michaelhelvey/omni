@@ -6,9 +6,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::formatter::{Formatter, Signal};
 use crate::language::Language;
+use crate::pyproject::PyProject;
 
 /// Files that show that a directory is the root of a project.
-const PROJECT_MARKERS: &[&str] = &[".git", "package.json", "Cargo.toml"];
+const PROJECT_MARKERS: &[&str] = &[".git", "package.json", "Cargo.toml", "pyproject.toml"];
 
 /// The result of resolution for one language in one directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +163,10 @@ impl Resolver {
             .filter(|f| f.supports(language))
             .collect();
         for &formatter in &defaults {
-            if let Some(binary) = (self.path_lookup)(formatter.path_bin()) {
+            if let Some(binary) = formatter
+                .path_bin()
+                .and_then(|name| (self.path_lookup)(name))
+            {
                 return Decision {
                     outcome: Outcome::Format {
                         formatter,
@@ -187,18 +191,12 @@ impl Resolver {
         }
     }
 
-    /// Find the binary for a formatter. omni prefers the binary in `node_modules/.bin`, so that
-    /// the project gets the version that it installed.
+    /// Find the binary for a formatter. omni prefers the binary that the project installed (for
+    /// example in `node_modules/.bin` or `.venv/bin`), so that the project gets its own version.
     fn find_binary(&self, formatter: Formatter, dir: &Utf8Path) -> Option<Utf8PathBuf> {
-        if let Some(name) = formatter.npm_bin() {
-            // On Windows, npm installs a `.cmd` wrapper. Only the wrapper can run.
-            let file_name = if cfg!(windows) {
-                format!("{name}.cmd")
-            } else {
-                name.to_owned()
-            };
+        if let Some(local_bin) = formatter.local_bin() {
             for ancestor in dir.ancestors() {
-                let candidate = ancestor.join("node_modules").join(".bin").join(&file_name);
+                let candidate = ancestor.join(&local_bin);
                 if candidate.is_file() {
                     return Some(candidate);
                 }
@@ -208,8 +206,30 @@ impl Resolver {
                 }
             }
         }
-        (self.path_lookup)(formatter.path_bin())
+        formatter
+            .path_bin()
+            .and_then(|name| (self.path_lookup)(name))
     }
+}
+
+/// Read and parse the file `name` in `dir`, if it exists. If omni cannot read or parse the file,
+/// it writes a warning and continues as if the file does not exist.
+fn read_manifest<T>(
+    dir: &Utf8Path,
+    entries: &HashSet<String>,
+    name: &str,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> Option<T> {
+    if !entries.contains(name) {
+        return None;
+    }
+    let path = dir.join(name);
+    let text = std::fs::read_to_string(&path)
+        .inspect_err(|err| log::warn!("cannot read `{path}`: {err}"))
+        .ok()?;
+    parse(&text)
+        .inspect_err(|err| log::warn!("cannot parse `{path}`: {err}"))
+        .ok()
 }
 
 fn read_dir_info(dir: &Utf8Path) -> DirInfo {
@@ -221,25 +241,15 @@ fn read_dir_info(dir: &Utf8Path) -> DirInfo {
         .map(|entry| entry.file_name().to_owned())
         .collect();
 
-    let package_json = if entries.contains("package.json") {
-        let path = dir.join("package.json");
-        match std::fs::read_to_string(&path).map(|text| serde_json::from_str(&text)) {
-            Ok(Ok(value)) => Some(value),
-            Ok(Err(err)) => {
-                log::warn!("cannot parse `{path}`: {err}");
-                None
-            }
-            Err(err) => {
-                log::warn!("cannot read `{path}`: {err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let package_json = read_manifest(dir, &entries, "package.json", |text| {
+        serde_json::from_str::<serde_json::Value>(text).map_err(|e| e.to_string())
+    });
+    let pyproject = read_manifest(dir, &entries, "pyproject.toml", |text| {
+        PyProject::parse(text).map_err(|e| e.to_string())
+    });
 
     DirInfo {
-        signals: Formatter::detect(&entries, package_json.as_ref()),
+        signals: Formatter::detect(&entries, package_json.as_ref(), pyproject.as_ref()),
         project_marker: PROJECT_MARKERS
             .iter()
             .copied()
@@ -343,10 +353,64 @@ mod tests {
                 "package.json",
                 r#"{ "devDependencies": { "vite-plus": "1" } }"#,
             )
-            .file("node_modules/.bin/vp", "");
+            .file("node_modules/.bin/oxfmt", "");
 
-        let decision = resolver(&[]).resolve(&fx.dir("src"), Language::TypeScript);
-        assert_eq!(formatter(&decision), Some(Formatter::VitePlus));
+        // A global `oxfmt` must not replace the wrapper from `vite-plus`.
+        let decision = resolver(&["oxfmt"]).resolve(&fx.dir("src"), Language::TypeScript);
+        let Outcome::Format {
+            formatter, binary, ..
+        } = decision.outcome
+        else {
+            panic!("expected a formatter");
+        };
+        assert_eq!(formatter, Formatter::VitePlus);
+        assert_eq!(binary, Some(fx.root.join("node_modules/.bin/oxfmt")));
+
+        // Without the project binary, a global `oxfmt` is not a replacement.
+        std::fs::remove_file(fx.root.join("node_modules/.bin/oxfmt")).unwrap();
+        let decision = resolver(&["oxfmt"]).resolve(&fx.dir("src"), Language::TypeScript);
+        assert!(matches!(
+            decision.outcome,
+            Outcome::Format { binary: None, .. }
+        ));
+    }
+
+    #[test]
+    fn ruff_from_pyproject_with_venv_binary() {
+        let fx = Fixture::new();
+        fx.file(".git/HEAD", "")
+            .file(
+                "pyproject.toml",
+                "[project]\nname = \"x\"\n[dependency-groups]\ndev = [\"ruff>=0.5\"]\n",
+            )
+            .file(".venv/bin/ruff", "");
+
+        let decision = resolver(&["ruff"]).resolve(&fx.dir("src/pkg"), Language::Python);
+        let Outcome::Format {
+            formatter, binary, ..
+        } = decision.outcome
+        else {
+            panic!("expected a formatter");
+        };
+        assert_eq!(formatter, Formatter::Ruff);
+        assert_eq!(binary, Some(fx.root.join(".venv/bin/ruff")));
+    }
+
+    #[test]
+    fn python_project_without_ruff_is_skipped() {
+        let fx = Fixture::new();
+        fx.file("pyproject.toml", "[project]\nname = \"x\"\n");
+
+        let decision = resolver(&["ruff"]).resolve(&fx.root, Language::Python);
+        assert_eq!(decision.outcome, Outcome::Skip);
+    }
+
+    #[test]
+    fn python_outside_project_uses_ruff() {
+        let fx = Fixture::new();
+        let decision =
+            resolver(&["ruff", "prettier"]).resolve(&fx.dir("scripts"), Language::Python);
+        assert_eq!(formatter(&decision), Some(Formatter::Ruff));
     }
 
     #[test]

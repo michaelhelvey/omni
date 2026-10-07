@@ -145,10 +145,29 @@ fn format(
         .unwrap_or_default();
 
     log::debug!("formatting `{filepath}` with {formatter} in `{root}`");
-    let mut child = Command::new(&binary)
-        .args(extra_args)
-        .args(formatter.stdin_args(&name, edition.as_deref()))
-        .current_dir(&root)
+    // Some formatters use more than one command, for example ruff sorts the imports and then
+    // formats. Each command gets the output of the previous command.
+    let mut current = source.to_vec();
+    for args in formatter.stdin_commands(&name, edition.as_deref(), extra_args) {
+        match run_command(&binary, &args, &root, &current)? {
+            Some(output) => current = output,
+            None => return Ok(Formatted::Failed),
+        }
+    }
+    Ok(Formatted::Output(current))
+}
+
+/// Run `binary` in `dir`, with `input` on stdin. Returns stdout, or `None` if the command fails.
+/// The command writes its errors to the stderr of omni.
+fn run_command(
+    binary: &Utf8Path,
+    args: &[String],
+    dir: &Utf8Path,
+    input: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let mut child = Command::new(binary)
+        .args(args)
+        .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -161,17 +180,13 @@ fn format(
     let output = std::thread::scope(|scope| {
         scope.spawn(move || {
             // If the formatter stops early, the write fails. The exit status shows the problem.
-            let _ = stdin.write_all(source);
+            let _ = stdin.write_all(input);
         });
         child.wait_with_output()
     })
     .with_context(|| format!("cannot run `{binary}`"))?;
 
-    if output.status.success() {
-        Ok(Formatted::Output(output.stdout))
-    } else {
-        Ok(Formatted::Failed)
-    }
+    Ok(output.status.success().then_some(output.stdout))
 }
 
 /// Make `path` absolute. Remove the `.` and `..` components.

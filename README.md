@@ -13,10 +13,11 @@ command (for example `npm run fmt` or `cargo fmt`) for that.
 
 | Formatter | Languages                                       | omni uses it when                                                                |
 | --------- | ----------------------------------------------- | -------------------------------------------------------------------------------- |
-| vp fmt    | JS, TS, JSON, YAML, TOML, HTML, CSS, Markdown…  | `vite.config.*` exists and `vite-plus` is in `package.json` ([Vite+](https://viteplus.dev)), or `vite-plus` is in `package.json` |
+| Vite+     | JS, TS, JSON, YAML, TOML, HTML, CSS, Markdown…  | `vite.config.*` exists and `vite-plus` is in `package.json` ([Vite+](https://viteplus.dev)), or `vite-plus` is in `package.json` |
 | oxfmt     | JS, TS, JSON, YAML, TOML, HTML, CSS, Markdown…  | `.oxfmtrc.json`, `.oxfmtrc.jsonc`, `oxfmt.config.ts` or `oxfmt.config.mts` exists, or `oxfmt` is in `package.json` |
 | rs fmt    | JS, TS, JSON, YAML, HTML, CSS, Markdown…        | `rstack.config.{ts,js,mts,mjs}` exists, or `rstack` is in `package.json`          |
 | prettier  | JS, TS, JSON, YAML, HTML, CSS, Markdown…        | a prettier configuration file exists, `package.json` has a `prettier` key, or `prettier` is in `package.json` |
+| ruff      | Python                                          | `ruff.toml` or `.ruff.toml` exists, `pyproject.toml` has a `[tool.ruff]` table, or `ruff` is a dependency in `pyproject.toml` |
 | rustfmt   | Rust                                            | `Cargo.toml`, `rustfmt.toml` or `.rustfmt.toml` exists                            |
 
 omni does not include these formatters. Install the formatters that you use.
@@ -132,11 +133,12 @@ VS Code cannot run an external formatter without an extension. Install
         "mdx",
         "graphql",
         "handlebars",
+        "python",
         "rust"
       ]
     }
   ],
-  "[javascript][javascriptreact][typescript][typescriptreact][json][jsonc][yaml][toml][html][vue][svelte][css][scss][less][markdown][mdx][graphql][handlebars][rust]": {
+  "[javascript][javascriptreact][typescript][typescriptreact][json][jsonc][yaml][toml][html][vue][svelte][css][scss][less][markdown][mdx][graphql][handlebars][python][rust]": {
     "editor.defaultFormatter": "jkillian.custom-local-formatters",
     "editor.formatOnSave": true
   }
@@ -154,20 +156,30 @@ contain spaces.
 3. In the first directory that has a signal for a formatter that supports the language, omni
    selects that formatter. A configuration file is a stronger signal than a `package.json` key,
    and a `package.json` key is stronger than a dependency. If two signals have the same strength,
-   the priority is vp fmt, then oxfmt, then rs fmt, then prettier, then rustfmt.
-4. If the file is in a project (a directory with `.git`, `package.json` or `Cargo.toml`), but no
+   the priority is Vite+, then oxfmt, then rs fmt, then prettier, then rustfmt.
+4. If the file is in a project (a directory with `.git`, `package.json`, `Cargo.toml` or
+   `pyproject.toml`), but no
    formatter has a signal, omni does not format the file.
 5. If the file is not in a project, omni uses the first default formatter on `PATH` that supports
    the language: prettier, then oxfmt. For Rust, the default is rustfmt. To format files outside a
-   project, install prettier globally (`npm install -g prettier`).
+   project, install prettier globally (`npm install -g prettier`). For Python, the default is
+   ruff.
 
-omni reads `package.json` to find signals. omni does not read the contents of formatter
+omni reads `package.json` and `pyproject.toml` to find signals. omni does not read the contents of formatter
 configuration files. If a configuration file exists, omni uses its formatter. The only exception
-is `vite.config.*`: plain Vite projects also have this file, so omni uses vp fmt only if
+is `vite.config.*`: plain Vite projects also have this file, so omni uses Vite+ only if
 `package.json` also has `vite-plus`.
 
-omni prefers the binary in the `node_modules/.bin` directory of the project. If it does not find
-one, it uses the binary on `PATH`.
+For a Vite+ project, omni does not run `vp fmt`, because it is slow for one file. omni runs
+`node_modules/.bin/oxfmt`. `vite-plus` installs this program for editors, and it applies the `fmt`
+block in `vite.config.*`. omni does not use an `oxfmt` from `PATH` for a Vite+ project. Run your
+package manager's install command first.
+
+omni prefers the binary that the project installed: `node_modules/.bin` for npm packages, and
+`.venv/bin` for ruff. If it does not find one, it uses the binary on `PATH`.
+
+For Python, omni sorts the imports and then formats the file. This is the same as
+`ruff check --select I001 --fix` and then `ruff format`. omni does not apply other lint fixes.
 
 ## Options for files outside a project
 
@@ -185,9 +197,16 @@ proseWrap = "always"
 
 [defaults.rustfmt]
 max_width = 100
+
+[defaults.ruff]
+line-length = 100
+
+[defaults.ruff.format]
+quote-style = "single"
 ```
 
-Each table uses the option names of its formatter. You can use `prettier`, `oxfmt` and `rustfmt`.
+Each table uses the option names of its formatter. You can use `prettier`, `oxfmt`, `ruff` and
+`rustfmt`.
 
 omni uses these options only when it selects a default formatter, so only for files that are not
 in a project. In a project, the configuration of the project controls the formatter, and omni

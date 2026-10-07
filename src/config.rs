@@ -18,7 +18,12 @@ use crate::formatter::Formatter;
 
 /// The formatters that can have default options. These are the formatters that omni can select
 /// as a default.
-const CONFIGURABLE: &[Formatter] = &[Formatter::Prettier, Formatter::Oxfmt, Formatter::Rustfmt];
+const CONFIGURABLE: &[Formatter] = &[
+    Formatter::Prettier,
+    Formatter::Oxfmt,
+    Formatter::Ruff,
+    Formatter::Rustfmt,
+];
 
 /// The contents of the user configuration file.
 #[derive(Debug, Default)]
