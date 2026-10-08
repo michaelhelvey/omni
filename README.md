@@ -17,6 +17,7 @@ the code is pure vibeslop i just wanted my neovim config to work
 | prettier  | JS, TS, JSON, YAML, HTML, CSS, Markdown…       | a prettier configuration file exists, `package.json` has a `prettier` key, or `prettier` is in `package.json`                    |
 | ruff      | Python                                         | `ruff.toml` or `.ruff.toml` exists, `pyproject.toml` has a `[tool.ruff]` table, or `ruff` is a dependency in `pyproject.toml`    |
 | rustfmt   | Rust                                           | `Cargo.toml`, `rustfmt.toml` or `.rustfmt.toml` exists                                                                           |
+| gofmt     | Go                                             | `go.mod` exists                                                                                                                  |
 
 omni does not include these formatters. Install the formatters that you use.
 
@@ -132,11 +133,12 @@ VS Code cannot run an external formatter without an extension. Install
         "graphql",
         "handlebars",
         "python",
-        "rust"
+        "rust",
+        "go"
       ]
     }
   ],
-  "[javascript][javascriptreact][typescript][typescriptreact][json][jsonc][yaml][toml][html][vue][svelte][css][scss][less][markdown][mdx][graphql][handlebars][python][rust]": {
+  "[javascript][javascriptreact][typescript][typescriptreact][json][jsonc][yaml][toml][html][vue][svelte][css][scss][less][markdown][mdx][graphql][handlebars][python][rust][go]": {
     "editor.defaultFormatter": "jkillian.custom-local-formatters",
     "editor.formatOnSave": true
   }
@@ -154,12 +156,13 @@ contain spaces.
 3. In the first directory that has a signal for a formatter that supports the language, omni selects
    that formatter. A configuration file is a stronger signal than a `package.json` key, and a
    `package.json` key is stronger than a dependency. If two signals have the same strength, the
-   priority is Vite+, then oxfmt, then rs fmt, then prettier, then rustfmt.
-4. If the file is in a project (a directory with `.git`, `package.json`, `Cargo.toml` or
-   `pyproject.toml`), but no formatter has a signal, omni does not format the file.
+   priority is Vite+, then oxfmt, then rs fmt, then prettier, then rustfmt, then gofmt.
+4. If the file is in a project (a directory with `.git`, `package.json`, `Cargo.toml`,
+   `pyproject.toml` or `go.mod`), but no formatter has a signal, omni does not format the file.
 5. If the file is not in a project, omni uses the first default formatter on `PATH` that supports
    the language: prettier, then oxfmt. For Rust, the default is rustfmt. To format files outside a
    project, install prettier globally (`npm install -g prettier`). For Python, the default is ruff.
+   For Go, the default is gofmt.
 
 omni reads `package.json` and `pyproject.toml` to find signals. omni does not read the contents of
 formatter configuration files. If a configuration file exists, omni uses its formatter. The only
@@ -204,7 +207,7 @@ quote-style = "single"
 ```
 
 Each table uses the option names of its formatter. You can use `prettier`, `oxfmt`, `ruff` and
-`rustfmt`.
+`rustfmt`. gofmt has no options.
 
 omni uses these options only when it selects a default formatter, so only for files that are not in
 a project. In a project, the configuration of the project controls the formatter, and omni does not

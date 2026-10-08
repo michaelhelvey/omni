@@ -35,6 +35,9 @@ pub enum Formatter {
     Ruff,
     /// [rustfmt](https://github.com/rust-lang/rustfmt).
     Rustfmt,
+    /// [gofmt](https://pkg.go.dev/cmd/gofmt). It is the same formatter as `go fmt`. It has no
+    /// options.
+    Gofmt,
 }
 
 /// How strongly a project signal shows that the project uses a formatter.
@@ -43,7 +46,7 @@ pub enum Formatter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Strength {
     /// The formatter is a dependency in `package.json` or `pyproject.toml`, or the project is a
-    /// Cargo package.
+    /// Cargo package or a Go module.
     Dependency,
     /// `package.json` or `pyproject.toml` has a key for the formatter configuration.
     ManifestKey,
@@ -121,6 +124,7 @@ impl Formatter {
             Formatter::Prettier => "prettier",
             Formatter::Ruff => "ruff",
             Formatter::Rustfmt => "rustfmt",
+            Formatter::Gofmt => "gofmt",
         }
     }
 
@@ -128,13 +132,14 @@ impl Formatter {
     pub fn supports(self, language: Language) -> bool {
         use Language::*;
         match self {
-            Formatter::VitePlus | Formatter::Oxfmt => !matches!(language, Rust | Python),
+            Formatter::VitePlus | Formatter::Oxfmt => !matches!(language, Rust | Python | Go),
             // rs fmt supports the same built-in languages as Prettier.
             Formatter::Rstack | Formatter::Prettier => {
-                !matches!(language, Rust | Python | Toml | Svelte)
+                !matches!(language, Rust | Python | Go | Toml | Svelte)
             }
             Formatter::Ruff => matches!(language, Python),
             Formatter::Rustfmt => matches!(language, Rust),
+            Formatter::Gofmt => matches!(language, Go),
         }
     }
 
@@ -143,6 +148,7 @@ impl Formatter {
         match language {
             Language::Rust => &[Formatter::Rustfmt],
             Language::Python => &[Formatter::Ruff],
+            Language::Go => &[Formatter::Gofmt],
             // Prettier does not support all languages. oxfmt formats the others.
             _ => &[Formatter::Prettier, Formatter::Oxfmt],
         }
@@ -173,7 +179,7 @@ impl Formatter {
             // The virtual environment that uv and most other tools make.
             Formatter::Ruff if cfg!(windows) => vec![".venv/Scripts/ruff.exe".into()],
             Formatter::Ruff => vec![".venv/bin/ruff".into()],
-            Formatter::Rustfmt => Vec::new(),
+            Formatter::Rustfmt | Formatter::Gofmt => Vec::new(),
         }
     }
 
@@ -214,6 +220,7 @@ impl Formatter {
             Formatter::Prettier => Some("prettier"),
             Formatter::Ruff => Some("ruff"),
             Formatter::Rustfmt => Some("rustfmt"),
+            Formatter::Gofmt => Some("gofmt"),
         }
     }
 
@@ -250,6 +257,13 @@ impl Formatter {
                 formatter: Formatter::Rustfmt,
                 strength: Strength::Dependency,
                 reason: "found `Cargo.toml`".to_owned(),
+            });
+        }
+        if entries.contains("go.mod") {
+            signals.push(Signal {
+                formatter: Formatter::Gofmt,
+                strength: Strength::Dependency,
+                reason: "found `go.mod`".to_owned(),
             });
         }
 
@@ -375,6 +389,8 @@ impl Formatter {
                     &["--emit=stdout"],
                 ])]
             }
+            // Without a file argument, gofmt reads stdin and writes stdout.
+            Formatter::Gofmt => vec![command(&[&options])],
         }
     }
 }
@@ -445,6 +461,7 @@ impl Formatter {
             Formatter::VitePlus | Formatter::Rstack => {
                 bail!("{self} cannot be a default formatter, so it has no default options")
             }
+            Formatter::Gofmt => bail!("{self} has no options"),
         }
     }
 }
@@ -657,6 +674,10 @@ mod tests {
             Formatter::Rustfmt.stdin_commands(oxfmt, path, Some("2024"), &[]),
             [["--edition=2024", "--emit=stdout"]]
         );
+        assert_eq!(
+            Formatter::Gofmt.stdin_commands(oxfmt, Utf8Path::new("a/b.go"), None, &[]),
+            [Vec::<String>::new()]
+        );
     }
 
     #[test]
@@ -712,6 +733,14 @@ mod tests {
         let signals = Formatter::detect(&entries(&["pyproject.toml"]), None, Some(&pyproject));
         let strengths: Vec<Strength> = signals.iter().map(|s| s.strength).collect();
         assert_eq!(strengths, [Strength::ManifestKey, Strength::Dependency]);
+    }
+
+    #[test]
+    fn detects_go_mod() {
+        let signals = Formatter::detect(&entries(&["go.mod", "go.sum", "main.go"]), None, None);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].formatter, Formatter::Gofmt);
+        assert_eq!(signals[0].strength, Strength::Dependency);
     }
 
     #[test]

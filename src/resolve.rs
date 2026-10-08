@@ -9,7 +9,13 @@ use crate::language::Language;
 use crate::pyproject::PyProject;
 
 /// Files that show that a directory is the root of a project.
-const PROJECT_MARKERS: &[&str] = &[".git", "package.json", "Cargo.toml", "pyproject.toml"];
+const PROJECT_MARKERS: &[&str] = &[
+    ".git",
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+];
 
 /// The result of resolution for one language in one directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +460,53 @@ mod tests {
         let decision =
             resolver(&["ruff", "prettier"]).resolve(&fx.dir("scripts"), Language::Python);
         assert_eq!(formatter(&decision), Some(Formatter::Ruff));
+    }
+
+    #[test]
+    fn go_module_uses_gofmt() {
+        let fx = Fixture::new();
+        fx.file(".git/HEAD", "")
+            .file("go.mod", "module example.com/x\n\ngo 1.24\n")
+            .file(".prettierrc", "{}");
+
+        let r = resolver(&["gofmt", "prettier"]);
+        // `go.mod` is not a signal for other languages.
+        let md = r.resolve(&fx.root, Language::Markdown);
+        assert_eq!(formatter(&md), Some(Formatter::Prettier));
+
+        let decision = r.resolve(&fx.dir("internal/server"), Language::Go);
+        let Outcome::Format {
+            formatter,
+            root,
+            binary,
+            default,
+        } = decision.outcome
+        else {
+            panic!("expected a formatter");
+        };
+        assert_eq!(formatter, Formatter::Gofmt);
+        assert_eq!(root, fx.root);
+        assert_eq!(binary, Some(Utf8PathBuf::from("/bin/gofmt")));
+        assert!(!default);
+    }
+
+    #[test]
+    fn go_module_without_git_is_a_project() {
+        let fx = Fixture::new();
+        fx.file("go.mod", "module example.com/x\n");
+
+        let decision = resolver(&["prettier"]).resolve(&fx.root, Language::Markdown);
+        assert_eq!(decision.outcome, Outcome::Skip);
+    }
+
+    #[test]
+    fn go_outside_project_uses_gofmt() {
+        let fx = Fixture::new();
+        let decision = resolver(&["gofmt", "prettier"]).resolve(&fx.dir("scratch"), Language::Go);
+        assert_eq!(formatter(&decision), Some(Formatter::Gofmt));
+
+        let decision = resolver(&["prettier"]).resolve(&fx.dir("scratch"), Language::Go);
+        assert_eq!(decision.outcome, Outcome::Skip);
     }
 
     #[test]

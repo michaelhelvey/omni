@@ -25,6 +25,9 @@ const CONFIGURABLE: &[Formatter] = &[
     Formatter::Rustfmt,
 ];
 
+/// The default formatters that have no options.
+const NO_OPTIONS: &[Formatter] = &[Formatter::Gofmt];
+
 /// The contents of the user configuration file.
 #[derive(Debug, Default)]
 pub struct Config {
@@ -65,6 +68,9 @@ impl Config {
                 bail!("`defaults` must be a table");
             };
             for (name, options) in sections {
+                if NO_OPTIONS.iter().any(|f| f.name() == name) {
+                    bail!("`defaults.{name}` is not possible, because {name} has no options");
+                }
                 let Some(&formatter) = CONFIGURABLE.iter().find(|f| f.name() == name) else {
                     let names: Vec<&str> = CONFIGURABLE.iter().map(|f| f.name()).collect();
                     bail!(
@@ -123,6 +129,12 @@ mod tests {
     fn rejects_formatters_that_are_never_defaults() {
         let err = Config::parse("[defaults.\"vp fmt\"]\nprintWidth = 100\n").unwrap_err();
         assert!(err.to_string().contains("not a default formatter"));
+    }
+
+    #[test]
+    fn rejects_formatters_without_options() {
+        let err = Config::parse("[defaults.gofmt]\ntabwidth = 4\n").unwrap_err();
+        assert!(err.to_string().contains("gofmt has no options"));
     }
 
     #[test]

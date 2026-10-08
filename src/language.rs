@@ -53,6 +53,8 @@ pub enum Language {
     Python,
     /// Rust: `.rs`.
     Rust,
+    /// Go: `.go`.
+    Go,
 }
 
 impl Language {
@@ -79,6 +81,7 @@ impl Language {
         Language::Handlebars,
         Language::Python,
         Language::Rust,
+        Language::Go,
     ];
 
     /// Find the language of a file from its name. Returns `None` if omni does not know the file.
@@ -121,6 +124,7 @@ impl Language {
             "hbs" | "handlebars" => Language::Handlebars,
             "py" | "pyi" => Language::Python,
             "rs" => Language::Rust,
+            "go" => Language::Go,
             _ => return None,
         };
         Some(language)
@@ -150,6 +154,7 @@ impl Language {
             Language::Handlebars => "hbs",
             Language::Python => "py",
             Language::Rust => "rs",
+            Language::Go => "go",
         }
     }
 }
@@ -176,6 +181,7 @@ mod tests {
         );
         assert_eq!(Language::from_path("x.TSX".into()), Some(Language::Tsx));
         assert_eq!(Language::from_path("main.rs".into()), Some(Language::Rust));
+        assert_eq!(Language::from_path("main.go".into()), Some(Language::Go));
         assert_eq!(Language::from_path("image.png".into()), None);
         assert_eq!(Language::from_path("Makefile".into()), None);
     }
@@ -188,6 +194,9 @@ mod tests {
         );
         assert_eq!(Language::from_path("Cargo.lock".into()), None);
         assert_eq!(Language::from_path("package-lock.json".into()), None);
+        // gofmt cannot format these files.
+        assert_eq!(Language::from_path("go.mod".into()), None);
+        assert_eq!(Language::from_path("go.sum".into()), None);
     }
 
     #[test]
