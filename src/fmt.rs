@@ -145,11 +145,24 @@ fn format(
         .unwrap_or_default();
 
     log::debug!("formatting `{filepath}` with {formatter} in `{root}`");
+    // oxfmt reads the `fmt` block in `vite.config.*` only when `VP_VERSION` is set. The shim that
+    // `vite-plus` installs sets it. The `oxfmt` binary in the pnpm store does not. The CLI sets
+    // its own version, so do not replace it.
+    let vite_plus_version = match formatter {
+        Formatter::VitePlus if !formatter.is_cli(&binary) => vite_plus_version(&root),
+        _ => None,
+    };
     // Some formatters use more than one command, for example ruff sorts the imports and then
     // formats. Each command gets the output of the previous command.
     let mut current = source.to_vec();
-    for args in formatter.stdin_commands(&name, edition.as_deref(), extra_args) {
-        match run_command(&binary, &args, &root, &current)? {
+    for args in formatter.stdin_commands(&binary, &name, edition.as_deref(), extra_args) {
+        match run_command(
+            &binary,
+            &args,
+            &root,
+            &current,
+            vite_plus_version.as_deref(),
+        )? {
             Some(output) => current = output,
             None => return Ok(Formatted::Failed),
         }
@@ -157,20 +170,47 @@ fn format(
     Ok(Formatted::Output(current))
 }
 
+/// The version of the `vite-plus` package that the project installed.
+///
+/// `oxfmt` reads the `fmt` block in `vite.config.*` only when `VP_VERSION` is set. Returns `None`
+/// if omni cannot find the package.
+fn vite_plus_version(root: &Utf8Path) -> Option<String> {
+    for ancestor in root.ancestors() {
+        let path = ancestor.join("node_modules/vite-plus/package.json");
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(version) = json.get("version").and_then(|version| version.as_str())
+        {
+            return Some(version.to_owned());
+        }
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    None
+}
+
 /// Run `binary` in `dir`, with `input` on stdin. Returns stdout, or `None` if the command fails.
-/// The command writes its errors to the stderr of omni.
+/// The command writes its errors to the stderr of omni. `vite_plus_version` sets `VP_VERSION` for
+/// `oxfmt` when it is `Some`.
 fn run_command(
     binary: &Utf8Path,
     args: &[String],
     dir: &Utf8Path,
     input: &[u8],
+    vite_plus_version: Option<&str>,
 ) -> Result<Option<Vec<u8>>> {
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(version) = vite_plus_version {
+        command.env("VP_VERSION", version);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("cannot run `{binary}`"))?;
 

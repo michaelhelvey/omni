@@ -19,9 +19,10 @@ pub enum Formatter {
     /// [Vite+](https://viteplus.dev/guide/fmt). It formats with oxfmt and the `fmt` block of
     /// `vite.config.*`, so it has a higher priority than oxfmt.
     ///
-    /// omni does not run `vp fmt`, because it is approximately 7 times slower for one file. It runs
-    /// `node_modules/.bin/oxfmt`, which `vite-plus` installs for editors. This wrapper sets
-    /// `VP_VERSION`, so that oxfmt reads the `fmt` block in `vite.config.*`.
+    /// omni does not usually run `vp fmt`, because it starts slower for one file. It runs the
+    /// `oxfmt` binary that the project installed, and it sets `VP_VERSION`, so that oxfmt reads
+    /// the `fmt` block in `vite.config.*`. If the project does not have the `oxfmt` binary,
+    /// omni runs `vp fmt`.
     VitePlus,
     /// [oxfmt](https://oxc.rs/docs/guide/usage/formatter.html).
     Oxfmt,
@@ -147,27 +148,56 @@ impl Formatter {
         }
     }
 
-    /// The path of the binary that a project installs, relative to the project directory. For
-    /// example, `node_modules/.bin/prettier`. `None` if projects do not install the formatter.
-    pub fn local_bin(self) -> Option<Utf8PathBuf> {
-        let npm = |name: &str| {
-            // On Windows, npm installs a `.cmd` wrapper. Only the wrapper can run.
-            let name = if cfg!(windows) {
+    /// The paths of the binaries that a project installs, relative to the project directory, in
+    /// the order to try. For example, `node_modules/.bin/prettier`. The result is empty if
+    /// projects do not install the formatter.
+    pub fn local_bins(self) -> Vec<Utf8PathBuf> {
+        // On Windows, npm installs a `.cmd` wrapper. Only the wrapper can run.
+        let exe = |name: &str| {
+            if cfg!(windows) {
                 format!("{name}.cmd")
             } else {
                 name.to_owned()
-            };
-            Some(Utf8PathBuf::from("node_modules/.bin").join(name))
+            }
         };
+        let npm = |name: &str| Utf8PathBuf::from("node_modules/.bin").join(exe(name));
+        // pnpm does not put the binary of a dependency in the root `node_modules/.bin`. It puts
+        // it in the hidden `node_modules` directory of pnpm instead. `vite-plus` has `oxfmt` as a
+        // dependency, so this is where a Vite+ project has `oxfmt`.
+        let pnpm =
+            |name: &str| Utf8PathBuf::from("node_modules/.pnpm/node_modules/.bin").join(exe(name));
         match self {
-            Formatter::VitePlus | Formatter::Oxfmt => npm("oxfmt"),
-            Formatter::Rstack => npm("rs"),
-            Formatter::Prettier => npm("prettier"),
+            Formatter::VitePlus | Formatter::Oxfmt => vec![npm("oxfmt"), pnpm("oxfmt")],
+            Formatter::Rstack => vec![npm("rs")],
+            Formatter::Prettier => vec![npm("prettier")],
             // The virtual environment that uv and most other tools make.
-            Formatter::Ruff if cfg!(windows) => Some(".venv/Scripts/ruff.exe".into()),
-            Formatter::Ruff => Some(".venv/bin/ruff".into()),
-            Formatter::Rustfmt => None,
+            Formatter::Ruff if cfg!(windows) => vec![".venv/Scripts/ruff.exe".into()],
+            Formatter::Ruff => vec![".venv/bin/ruff".into()],
+            Formatter::Rustfmt => Vec::new(),
         }
+    }
+
+    /// The path of the CLI that formats for the formatter, relative to the project directory.
+    /// omni uses it when the project does not install the binary of the formatter.
+    ///
+    /// Only Vite+ has one: `vp fmt` gives the same result as the `oxfmt` binary of `vite-plus`,
+    /// but it starts slower. `None` if the formatter has no CLI.
+    pub fn cli_bin(self) -> Option<Utf8PathBuf> {
+        match self {
+            Formatter::VitePlus => Some(Utf8PathBuf::from(if cfg!(windows) {
+                "node_modules/.bin/vp.cmd"
+            } else {
+                "node_modules/.bin/vp"
+            })),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if `binary` is the CLI from [`Formatter::cli_bin`], and not the binary of
+    /// the formatter.
+    pub fn is_cli(self, binary: &Utf8Path) -> bool {
+        self.cli_bin()
+            .is_some_and(|cli| cli.file_stem() == binary.file_stem())
     }
 
     /// The name of the binary to find on `PATH`. `None` if omni must use the binary of the
@@ -291,6 +321,7 @@ impl Formatter {
     /// are the arguments from [`Formatter::option_args`].
     pub fn stdin_commands(
         self,
+        binary: &Utf8Path,
         filepath: &Utf8Path,
         edition: Option<&str>,
         options: &[String],
@@ -305,6 +336,11 @@ impl Formatter {
         let options: Vec<&str> = options.iter().map(String::as_str).collect();
 
         match self {
+            Formatter::VitePlus if self.is_cli(binary) => vec![command(&[
+                &["fmt"],
+                &options,
+                &["--stdin-filepath", &filepath],
+            ])],
             Formatter::VitePlus | Formatter::Oxfmt | Formatter::Prettier => {
                 vec![command(&[&options, &["--stdin-filepath", &filepath]])]
             }
@@ -594,7 +630,7 @@ mod tests {
     fn rstack_never_uses_rs_from_path() {
         assert_eq!(Formatter::Rstack.path_bin(), Some("rstack"));
         assert_eq!(
-            Formatter::Rstack.local_bin().unwrap().file_name(),
+            Formatter::Rstack.local_bins()[0].file_name(),
             Some(if cfg!(windows) { "rs.cmd" } else { "rs" })
         );
     }
@@ -602,16 +638,23 @@ mod tests {
     #[test]
     fn stdin_commands() {
         let path = Utf8Path::new("a/b.md");
+        let oxfmt = Utf8Path::new("/repo/node_modules/.bin/oxfmt");
         assert_eq!(
-            Formatter::VitePlus.stdin_commands(path, None, &[]),
+            Formatter::VitePlus.stdin_commands(oxfmt, path, None, &[]),
             [["--stdin-filepath", "a/b.md"]]
         );
+        // The fallback runs the CLI, which needs the `fmt` subcommand.
+        let vp = Utf8Path::new("/repo/node_modules/.bin/vp");
         assert_eq!(
-            Formatter::Rstack.stdin_commands(path, None, &[]),
+            Formatter::VitePlus.stdin_commands(vp, path, None, &[]),
             [["fmt", "--stdin-filepath", "a/b.md"]]
         );
         assert_eq!(
-            Formatter::Rustfmt.stdin_commands(path, Some("2024"), &[]),
+            Formatter::Rstack.stdin_commands(oxfmt, path, None, &[]),
+            [["fmt", "--stdin-filepath", "a/b.md"]]
+        );
+        assert_eq!(
+            Formatter::Rustfmt.stdin_commands(oxfmt, path, Some("2024"), &[]),
             [["--edition=2024", "--emit=stdout"]]
         );
     }
@@ -620,7 +663,12 @@ mod tests {
     fn ruff_sorts_imports_then_formats() {
         let path = Utf8Path::new("a/b.py");
         let options = ["--config".to_owned(), "line-length = 100".to_owned()];
-        let commands = Formatter::Ruff.stdin_commands(path, None, &options);
+        let commands = Formatter::Ruff.stdin_commands(
+            Utf8Path::new("/repo/.venv/bin/ruff"),
+            path,
+            None,
+            &options,
+        );
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0][0], "check");
         assert!(commands[0].contains(&"--select=I001".to_owned()));

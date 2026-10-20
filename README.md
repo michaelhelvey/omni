@@ -166,10 +166,12 @@ formatter configuration files. If a configuration file exists, omni uses its for
 exception is `vite.config.*`: plain Vite projects also have this file, so omni uses Vite+ only if
 `package.json` also has `vite-plus`.
 
-For a Vite+ project, omni does not run `vp fmt`, because it is slow for one file. omni runs
-`node_modules/.bin/oxfmt`. `vite-plus` installs this program for editors, and it applies the `fmt`
-block in `vite.config.*`. omni does not use an `oxfmt` from `PATH` for a Vite+ project. Run your
-package manager's install command first.
+For a Vite+ project, omni does not usually run `vp fmt`, because it starts slower for one file.
+omni runs the `oxfmt` binary that the project installed: `node_modules/.bin/oxfmt`, or
+`node_modules/.pnpm/node_modules/.bin/oxfmt` for pnpm. It sets `VP_VERSION`, so that `oxfmt`
+applies the `fmt` block in `vite.config.*`. If the project does not have an `oxfmt` binary, omni
+runs `node_modules/.bin/vp fmt`. omni does not use an `oxfmt` from `PATH` for a Vite+ project. Run
+your package manager's install command first.
 
 omni prefers the binary that the project installed: `node_modules/.bin` for npm packages, and
 `.venv/bin` for ruff. If it does not find one, it uses the binary on `PATH`.

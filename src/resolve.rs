@@ -140,6 +140,13 @@ impl Resolver {
         let binary = self.find_binary(best.formatter, dir);
         if binary.is_none() {
             reasons.push(format!("{} is not installed", best.formatter));
+        } else if let Some(binary) = &binary
+            && best.formatter.is_cli(binary)
+        {
+            reasons.push(format!(
+                "{} is not installed; using `{binary}`, which starts slower",
+                best.formatter
+            ));
         }
 
         Decision {
@@ -193,23 +200,39 @@ impl Resolver {
 
     /// Find the binary for a formatter. omni prefers the binary that the project installed (for
     /// example in `node_modules/.bin` or `.venv/bin`), so that the project gets its own version.
+    /// If the project does not install the binary, omni tries the CLI of the formatter, and then
+    /// `PATH`.
     fn find_binary(&self, formatter: Formatter, dir: &Utf8Path) -> Option<Utf8PathBuf> {
-        if let Some(local_bin) = formatter.local_bin() {
-            for ancestor in dir.ancestors() {
-                let candidate = ancestor.join(&local_bin);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                // Do not use a binary from outside the repository.
-                if ancestor.join(".git").exists() {
-                    break;
-                }
+        // Try every binary from the project before the CLI, because the binary starts faster.
+        for local_bin in formatter.local_bins() {
+            if let Some(binary) = find_local(dir, &local_bin) {
+                return Some(binary);
             }
+        }
+        if let Some(cli) = formatter.cli_bin()
+            && let Some(binary) = find_local(dir, &cli)
+        {
+            return Some(binary);
         }
         formatter
             .path_bin()
             .and_then(|name| (self.path_lookup)(name))
     }
+}
+
+/// Find `bin`, relative to `dir` or one of its ancestors. Returns `None` if no ancestor has the
+/// file. omni does not use a file from outside the repository.
+fn find_local(dir: &Utf8Path, bin: &Utf8Path) -> Option<Utf8PathBuf> {
+    for ancestor in dir.ancestors() {
+        let candidate = ancestor.join(bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    None
 }
 
 /// Read and parse the file `name` in `dir`, if it exists. If omni cannot read or parse the file,
@@ -373,6 +396,26 @@ mod tests {
             decision.outcome,
             Outcome::Format { binary: None, .. }
         ));
+
+        // pnpm puts the binary of a dependency in a hidden directory, not in `node_modules/.bin`.
+        let hidden = fx.root.join("node_modules/.pnpm/node_modules/.bin/oxfmt");
+        fx.file("node_modules/.pnpm/node_modules/.bin/oxfmt", "");
+        let decision = resolver(&[]).resolve(&fx.dir("src"), Language::TypeScript);
+        assert!(matches!(
+            decision.outcome,
+            Outcome::Format { binary: Some(ref binary), .. } if *binary == hidden
+        ));
+
+        // If the project has no `oxfmt` binary, use `vp fmt`.
+        std::fs::remove_file(&hidden).unwrap();
+        fx.file("node_modules/.bin/vp", "");
+        let decision = resolver(&[]).resolve(&fx.dir("src"), Language::TypeScript);
+        assert!(matches!(
+            decision.outcome,
+            Outcome::Format { binary: Some(ref binary), .. }
+                if *binary == fx.root.join("node_modules/.bin/vp")
+        ));
+        assert!(decision.reasons.iter().any(|r| r.contains("starts slower")));
     }
 
     #[test]
